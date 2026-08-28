@@ -1,0 +1,66 @@
+name: Daily Follow Builders Lark Digest
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai (UTC+8, no daylight saving time)
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  copilot-requests: write
+
+concurrency:
+  group: daily-follow-builders-lark
+  cancel-in-progress: false
+
+jobs:
+  generate-and-deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: scripts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefix scripts
+
+      - name: Install GitHub Copilot CLI
+        run: npm install --global @github/copilot
+
+      - name: Validate Lark secret
+        env:
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$LARK_WEBHOOK_URL" ]; then
+            echo "::error::Missing required repository secret LARK_WEBHOOK_URL"
+            exit 1
+          fi
+
+      - name: Reproduce Follow Builders v0.2 configuration
+        run: |
+          install -d -m 700 "$HOME/.follow-builders/prompts"
+          install -m 600 config/cloud-v0.2.json "$HOME/.follow-builders/config.json"
+          for prompt in prompts/v0.2/*.md; do
+            install -m 600 "$prompt" "$HOME/.follow-builders/prompts/$(basename "$prompt")"
+          done
+
+      - name: Generate Follow Builders v0.2 digest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/generate-digest.js > "$RUNNER_TEMP/follow-builders-digest.txt"
+
+      - name: Deliver digest to Lark
+        env:
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+        run: node scripts/deliver.js --file "$RUNNER_TEMP/follow-builders-digest.txt"

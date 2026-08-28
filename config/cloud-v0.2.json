@@ -1,0 +1,9 @@
+{
+  "platform": "other",
+  "language": "zh",
+  "frequency": "daily",
+  "delivery": {
+    "method": "lark"
+  },
+  "onboardingComplete": true
+}
