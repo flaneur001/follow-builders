@@ -397,7 +397,7 @@ Read `config.language` from the JSON:
 
 Read `config.delivery.method` from the JSON:
 
-**If "telegram" or "email":**
+**If "telegram", "email", or "lark":**
 ```bash
 echo '<your digest text>' > /tmp/fb-digest.txt
 cd ${CLAUDE_SKILL_DIR}/scripts && node deliver.js --file /tmp/fb-digest.txt 2>/dev/null
@@ -428,7 +428,7 @@ open an issue at https://github.com/zarazhangrui/follow-builders."
 - "Switch to Chinese/English/bilingual" → Update `language` in config.json
 
 ### Delivery Changes
-- "Switch to Telegram/email" → Update `delivery.method` in config.json, guide user through setup if needed
+- "Switch to Telegram/email/Lark" → Update `delivery.method` in config.json, guide user through setup if needed
 - "Change my email" → Update `delivery.email` in config.json
 - "Send to this chat instead" → Set `delivery.method` to "stdout"
 

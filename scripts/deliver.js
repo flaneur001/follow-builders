@@ -4,7 +4,7 @@
 // Follow Builders — Delivery Script
 // ============================================================================
 // Sends a digest to the user via their chosen delivery method.
-// Supports: Telegram bot, Email (via Resend), or stdout (default).
+// Supports: Telegram bot, Email (via Resend), Lark custom bot, or stdout (default).
 //
 // Usage:
 //   echo "digest text" | node deliver.js
@@ -17,6 +17,7 @@
 // Delivery methods:
 //   - "telegram": sends via Telegram Bot API (needs TELEGRAM_BOT_TOKEN + chat ID)
 //   - "email": sends via Resend API (needs RESEND_API_KEY + email address)
+//   - "lark": sends via a Lark custom bot (needs LARK_WEBHOOK_URL)
 //   - "stdout" (default): just prints to terminal
 // ============================================================================
 
@@ -149,6 +150,104 @@ async function sendEmail(text, apiKey, toEmail) {
   }
 }
 
+// -- Lark Delivery ----------------------------------------------------------
+
+// Lark custom bot webhook request bodies must not exceed 20 KB. Keep a small
+// margin and measure the complete serialized payload so multi-byte text is safe.
+const LARK_MAX_REQUEST_BYTES = 19 * 1024;
+
+function createLarkPayload(text) {
+  return {
+    msg_type: 'text',
+    content: { text }
+  };
+}
+
+function larkPayloadSize(text) {
+  return Buffer.byteLength(JSON.stringify(createLarkPayload(text)), 'utf-8');
+}
+
+function splitLarkText(text) {
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (larkPayloadSize(remaining) <= LARK_MAX_REQUEST_BYTES) {
+      chunks.push(remaining);
+      break;
+    }
+
+    const characters = Array.from(remaining);
+    let low = 1;
+    let high = characters.length;
+    let best = 0;
+
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = characters.slice(0, middle).join('');
+      if (larkPayloadSize(candidate) <= LARK_MAX_REQUEST_BYTES) {
+        best = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+
+    if (best === 0) {
+      throw new Error('Unable to split digest within the Lark message limit');
+    }
+
+    const candidate = characters.slice(0, best).join('');
+    const minimumReadableSplit = Math.floor(candidate.length / 2);
+    let splitAt = candidate.lastIndexOf('\n\n') + 2;
+    if (splitAt < minimumReadableSplit) splitAt = candidate.lastIndexOf('\n') + 1;
+    if (splitAt < minimumReadableSplit) splitAt = candidate.lastIndexOf(' ') + 1;
+    if (splitAt < minimumReadableSplit) splitAt = candidate.length;
+
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt);
+  }
+
+  return chunks;
+}
+
+async function sendLark(text, webhookUrl) {
+  const chunks = splitLarkText(text);
+
+  for (const chunk of chunks) {
+    let res;
+    try {
+      res = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(createLarkPayload(chunk))
+      });
+    } catch {
+      throw new Error('Lark webhook request failed (network error)');
+    }
+
+    if (!res.ok) {
+      throw new Error(`Lark webhook request failed (HTTP ${res.status})`);
+    }
+
+    let result;
+    try {
+      result = await res.json();
+    } catch {
+      throw new Error('Lark webhook returned an invalid response');
+    }
+
+    const code = result.code ?? result.StatusCode;
+    if (code !== 0) {
+      const safeCode = /^-?\d+$/.test(String(code)) ? code : 'unknown';
+      throw new Error(`Lark webhook rejected the message (code ${safeCode})`);
+    }
+
+    // Small delay keeps sequential chunks below Lark's per-second rate limit.
+    if (chunks.length > 1) await new Promise(r => setTimeout(r, 250));
+  }
+}
+
 // -- Main --------------------------------------------------------------------
 
 async function main() {
@@ -194,6 +293,18 @@ async function main() {
           status: 'ok',
           method: 'email',
           message: `Digest sent to ${toEmail}`
+        }));
+        break;
+      }
+
+      case 'lark': {
+        const webhookUrl = process.env.LARK_WEBHOOK_URL;
+        if (!webhookUrl) throw new Error('LARK_WEBHOOK_URL not found in .env');
+        await sendLark(digestText, webhookUrl);
+        console.log(JSON.stringify({
+          status: 'ok',
+          method: 'lark',
+          message: 'Digest sent to Lark'
         }));
         break;
       }
