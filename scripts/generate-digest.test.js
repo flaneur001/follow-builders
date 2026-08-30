@@ -1,14 +1,19 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { access, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  buildOnePassPrompt,
   buildStage1Prompt,
-  generateWithGemini,
+  generateAndDeliver,
+  generateDigest,
   generateTwoStageDigest,
+  generateWithDeepSeek,
+  resolvePipeline,
   validateDigest
 } from './generate-digest.js';
 
@@ -23,35 +28,65 @@ function fixture() {
     podcasts: [{ title: 'Podcast', transcript: 'RAW_PODCAST_SENTINEL', url: 'https://example.com/podcast' }],
     blogs: [{ title: 'Blog', content: 'RAW_BLOG_SENTINEL', url: 'https://example.com/blog' }],
     prompts: {
-      summarize_tweets: 'X_PROMPT_SENTINEL',
-      summarize_podcast: 'PODCAST_PROMPT_SENTINEL',
-      summarize_blogs: 'BLOG_PROMPT_SENTINEL',
-      digest_intro: 'DIGEST_PROMPT_SENTINEL',
-      translate: 'TRANSLATE_PROMPT_SENTINEL'
+      summarize_tweets: 'X_PROMPT_SENTINEL', summarize_podcast: 'PODCAST_PROMPT_SENTINEL',
+      summarize_blogs: 'BLOG_PROMPT_SENTINEL', digest_intro: 'DIGEST_PROMPT_SENTINEL', translate: 'TRANSLATE_PROMPT_SENTINEL'
     }
   };
 }
 
 function validDigest() {
   return [
-    'Personal AI Learning & Intelligence Digest — 2026-08-29',
-    '',
-    '## 1. Today in 3',
-    '',
+    'Personal AI Learning & Intelligence Digest — 2026-08-29', '', '## 1. Today in 3', '',
     `A grounded source item with enough explanatory text to make the validation fixture comfortably longer than three hundred characters. ${'Evidence and analysis. '.repeat(12)}`,
-    '',
-    'https://x.com/example/status/1',
-    '',
-    '## Think With It',
-    '',
-    'What boundary would make this workflow safer while preserving its useful capability?',
-    '',
-    FOOTER
+    '', 'https://x.com/example/status/1', '', '## Think With It', '',
+    'What boundary would make this workflow safer while preserving its useful capability?', '', FOOTER
   ].join('\n');
 }
 
-test('runs three source-specific calls before a notes-only Stage 2 call', async () => {
-  const prepared = fixture();
+function sse(data, lineEnd = '\n') { return `data: ${data}${lineEnd}${lineEnd}`; }
+
+function requestMock({ statusCode = 200, chunks }) {
+  let options;
+  let writes = '';
+  let calls = 0;
+  const requestImpl = (requestOptions, callback) => {
+    calls += 1;
+    options = requestOptions;
+    const request = new EventEmitter();
+    request.write = value => { writes += value; };
+    request.end = () => queueMicrotask(() => {
+      const response = new EventEmitter();
+      response.statusCode = statusCode;
+      callback(response);
+      for (const chunk of chunks) response.emit('data', Buffer.from(chunk));
+      response.emit('end');
+    });
+    return request;
+  };
+  return { requestImpl, get options() { return options; }, get writes() { return writes; }, get calls() { return calls; } };
+}
+
+test('unset pipeline defaults to one-pass and makes exactly one generation call', async () => {
+  assert.equal(resolvePipeline(undefined), 'one-pass');
+  const calls = [];
+  const result = await generateDigest(fixture(), {
+    pipeline: resolvePipeline(undefined),
+    generate: async prompt => { calls.push(prompt); return validDigest(); }
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(result.digest, validDigest());
+  assert.match(calls[0], /RAW_X_SENTINEL|RAW_PODCAST_SENTINEL|RAW_BLOG_SENTINEL/);
+});
+
+test('explicit one-pass makes exactly one generation call', async () => {
+  const calls = [];
+  await generateDigest(fixture(), { pipeline: 'one-pass', generate: async prompt => { calls.push(prompt); return validDigest(); } });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /DIGEST_PROMPT_SENTINEL/);
+  assert.match(calls[0], /X_PROMPT_SENTINEL/);
+});
+
+test('explicit two-stage makes four calls and Stage 2 never receives raw sources', async () => {
   const calls = [];
   const outputs = [
     'X_NOTES_SENTINEL https://x.com/example/status/1',
@@ -59,109 +94,112 @@ test('runs three source-specific calls before a notes-only Stage 2 call', async 
     'BLOG_NOTES_SENTINEL https://example.com/blog',
     validDigest()
   ];
-  const result = await generateTwoStageDigest(prepared, {
-    generate: async prompt => {
-      calls.push(prompt);
-      return outputs[calls.length - 1];
-    }
+  const result = await generateDigest(fixture(), {
+    pipeline: 'two-stage',
+    generate: async prompt => { calls.push(prompt); return outputs[calls.length - 1]; }
   });
-
   assert.equal(calls.length, 4);
-  assert.match(calls[0], /X_PROMPT_SENTINEL/);
   assert.match(calls[0], /RAW_X_SENTINEL/);
   assert.doesNotMatch(calls[0], /RAW_PODCAST_SENTINEL|RAW_BLOG_SENTINEL/);
-  assert.match(calls[1], /PODCAST_PROMPT_SENTINEL/);
   assert.match(calls[1], /RAW_PODCAST_SENTINEL/);
-  assert.doesNotMatch(calls[1], /RAW_X_SENTINEL|RAW_BLOG_SENTINEL/);
-  assert.match(calls[2], /BLOG_PROMPT_SENTINEL/);
   assert.match(calls[2], /RAW_BLOG_SENTINEL/);
-  assert.doesNotMatch(calls[2], /RAW_X_SENTINEL|RAW_PODCAST_SENTINEL/);
-
-  const stage2 = calls[3];
-  assert.match(stage2, /DIGEST_PROMPT_SENTINEL/);
-  assert.match(stage2, /TRANSLATE_PROMPT_SENTINEL/);
-  assert.match(stage2, /X_NOTES_SENTINEL/);
-  assert.match(stage2, /PODCAST_NOTES_SENTINEL/);
-  assert.match(stage2, /BLOG_NOTES_SENTINEL/);
-  assert.doesNotMatch(stage2, /RAW_X_SENTINEL|RAW_PODCAST_SENTINEL|RAW_BLOG_SENTINEL/);
-  assert.doesNotMatch(stage2, /X_PROMPT_SENTINEL|PODCAST_PROMPT_SENTINEL|BLOG_PROMPT_SENTINEL/);
+  assert.match(calls[3], /X_NOTES_SENTINEL|PODCAST_NOTES_SENTINEL|BLOG_NOTES_SENTINEL/);
+  assert.doesNotMatch(calls[3], /RAW_X_SENTINEL|RAW_PODCAST_SENTINEL|RAW_BLOG_SENTINEL/);
   assert.equal(result.digest, validDigest());
 });
 
-for (const failedStage of ['X', 'podcast', 'blogs']) {
-  test(`a ${failedStage} Stage 1 failure prevents Stage 2`, async () => {
-    const prepared = fixture();
-    let stage2Called = false;
-    await assert.rejects(
-      generateTwoStageDigest(prepared, {
-        generate: async prompt => {
-          if (prompt.includes('FINALIZED_V0_2_DIGEST_INTRO_BEGIN')) stage2Called = true;
-          if (prompt.includes(`${failedStage === 'X' ? 'X' : failedStage === 'podcast' ? 'PODCAST' : 'BLOG'}_PROMPT_SENTINEL`)) {
-            throw new Error('provider unavailable');
-          }
-          return 'notes';
-        }
-      }),
-      /Stage 1 .* generation failed: provider unavailable/
-    );
-    assert.equal(stage2Called, false);
-  });
-}
-
-test('a Stage 2 failure prevents a validated digest', async () => {
-  const prepared = fixture();
+test('a two-stage generation failure prevents Stage 2', async () => {
+  let stage2Called = false;
   await assert.rejects(
-    generateTwoStageDigest(prepared, {
+    generateTwoStageDigest(fixture(), {
       generate: async prompt => {
-        if (prompt.includes('FINALIZED_V0_2_DIGEST_INTRO_BEGIN')) {
-          throw new Error('provider unavailable');
-        }
+        if (prompt.includes('FINALIZED_V0_2_DIGEST_INTRO_BEGIN')) stage2Called = true;
+        if (prompt.includes('X_PROMPT_SENTINEL')) throw new Error('provider unavailable');
         return 'notes';
       }
     }),
-    /Stage 2 generation failed: provider unavailable/
+    /Stage 1 X generation failed: provider unavailable/
   );
+  assert.equal(stage2Called, false);
 });
 
-test('a Stage 2 validation failure is identified and prevents output', async () => {
-  const prepared = fixture();
+test('one-pass validation failure returns no digest for downstream delivery', async () => {
+  let deliveryCalled = false;
   await assert.rejects(
-    generateTwoStageDigest(prepared, {
-      generate: async prompt => prompt.includes('FINALIZED_V0_2_DIGEST_INTRO_BEGIN')
-        ? 'malformed final response'
-        : 'notes'
+    generateAndDeliver(fixture(), {
+      pipeline: 'one-pass', generate: async () => 'malformed final response',
+      deliver: async () => { deliveryCalled = true; }
     }),
-    /Stage 2 validation failed: Generated digest is unexpectedly short/
+    /One-pass validation failed: Generated digest is unexpectedly short/
   );
+  assert.equal(deliveryCalled, false);
 });
 
-test('source URL validation rejects links outside the prepared sources', () => {
-  const prepared = fixture();
-  assert.throws(
-    () => validateDigest(validDigest().replace('https://x.com/example/status/1', 'https://outside.example/fact'), prepared),
-    /URL not present in the prepared input/
-  );
-});
-
-test('Gemini provider is stateless, high-thinking, and redacts its API key from errors', async () => {
-  const apiKey = 'test-super-secret-key';
-  let request;
-  const fetchImpl = async (_url, options) => {
-    request = JSON.parse(options.body);
-    return {
-      ok: false,
-      status: 403,
-      text: async () => JSON.stringify({ error: { status: 'PERMISSION_DENIED', message: `bad key ${apiKey}` } })
-    };
-  };
-
+test('one-pass generation failure returns no digest for downstream delivery', async () => {
+  let deliveryCalled = false;
   await assert.rejects(
-    generateWithGemini('prompt', apiKey, fetchImpl),
+    generateAndDeliver(fixture(), {
+      pipeline: 'one-pass', generate: async () => { throw new Error('provider unavailable'); },
+      deliver: async () => { deliveryCalled = true; }
+    }),
+    /One-pass generation failed: provider unavailable/
+  );
+  assert.equal(deliveryCalled, false);
+});
+
+test('DeepSeek SSE succeeds only after terminal [DONE] and uses V4 Flash high thinking', async () => {
+  const mock = requestMock({ chunks: [
+    sse(JSON.stringify({ choices: [{ delta: { reasoning_content: 'hidden reasoning' } }] }), '\r\n'),
+    sse(JSON.stringify({ choices: [{ delta: { content: 'Hello ' } }] })) + sse(JSON.stringify({ choices: [{ delta: { content: 'world' } }] })) + sse('[DONE]')
+  ] });
+  const result = await generateWithDeepSeek('prompt', 'test-secret', { requestImpl: mock.requestImpl, agent: false });
+  assert.equal(result, 'Hello world');
+  assert.equal(mock.calls, 1);
+  assert.equal(mock.options.hostname, 'api.deepseek.com');
+  assert.equal(mock.options.path, '/chat/completions');
+  assert.equal(mock.options.headers.Authorization, 'Bearer test-secret');
+  assert.deepEqual(JSON.parse(mock.writes), {
+    model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'prompt' }], stream: true,
+    thinking: { type: 'enabled' }, reasoning_effort: 'high'
+  });
+});
+
+test('DeepSeek SSE without terminal [DONE] fails and never retries', async () => {
+  const mock = requestMock({ chunks: [sse(JSON.stringify({ choices: [{ delta: { content: 'partial' } }] }))] });
+  await assert.rejects(
+    generateWithDeepSeek('prompt', 'test-secret', { requestImpl: mock.requestImpl, agent: false }),
+    /stream ended without terminal \[DONE\]/
+  );
+  assert.equal(mock.calls, 1);
+});
+
+test('DeepSeek SSE rejects data after terminal [DONE]', async () => {
+  const mock = requestMock({ chunks: [
+    sse(JSON.stringify({ choices: [{ delta: { content: 'final' } }] })) +
+      sse('[DONE]') +
+      sse(JSON.stringify({ choices: [{ delta: { content: 'unexpected' } }] }))
+  ] });
+  await assert.rejects(
+    generateWithDeepSeek('prompt', 'test-secret', { requestImpl: mock.requestImpl, agent: false }),
+    /data after terminal \[DONE\]/
+  );
+  assert.equal(mock.calls, 1);
+});
+
+test('DeepSeek errors redact API keys', async () => {
+  const apiKey = 'test-super-secret-key';
+  const mock = requestMock({ statusCode: 403, chunks: [JSON.stringify({ error: `bad key ${apiKey}` })] });
+  await assert.rejects(
+    generateWithDeepSeek('prompt', apiKey, { requestImpl: mock.requestImpl, agent: false }),
     error => !error.message.includes(apiKey) && error.message.includes('[redacted]')
   );
-  assert.equal(request.model, 'gemini-3.7-flash');
-  assert.equal(request.store, false);
-  assert.equal(request.generation_config.thinking_level, 'high');
+});
+
+test('source URL validation rejects links outside prepared sources', () => {
+  assert.throws(
+    () => validateDigest(validDigest().replace('https://x.com/example/status/1', 'https://outside.example/fact'), fixture()),
+    /URL not present in the prepared input/
+  );
 });
 
 test('finalized v0.2 editorial prompts remain byte-for-byte unchanged', async () => {
@@ -172,25 +210,27 @@ test('finalized v0.2 editorial prompts remain byte-for-byte unchanged', async ()
     'summarize-tweets.md': '632e12016210996fb970cd9636d2051a75dcd311dc2ced7dfe8bada5e493b2f1',
     'translate.md': '423a5ff285714548b4e18e26e5c124551e800e023cc7e6a7c234f32564703a46'
   };
-
   for (const [filename, digest] of Object.entries(expected)) {
     const content = await readFile(join(REPO_DIR, 'prompts', 'v0.2', filename));
     assert.equal(createHash('sha256').update(content).digest('hex'), digest);
   }
 });
 
-test('workflow uses cloud secrets and sends only the validated final digest to Lark', async () => {
-  const workflow = await readFile(join(REPO_DIR, '.github', 'workflows', 'daily-lark-digest.yml'), 'utf8');
-  assert.match(workflow, /GEMINI_API_KEY: \$\{\{ secrets\.GEMINI_API_KEY \}\}/);
-  assert.match(workflow, /FOLLOW_BUILDERS_STAGE1_DIR: \$\{\{ runner\.temp \}\}\/follow-builders-stage1/);
-  assert.match(workflow, /generate-digest\.js > "\$RUNNER_TEMP\/follow-builders-digest\.txt"/);
-  assert.match(workflow, /- name: Deliver digest to Lark\n\s+if: success\(\)[\s\S]*deliver\.js --file "\$RUNNER_TEMP\/follow-builders-digest\.txt"/);
-  assert.doesNotMatch(workflow, /\/Users\/|\/private\/tmp\/|codex exec|GITHUB_TOKEN/);
-  assert.ok(workflow.indexOf('generate-digest.js') < workflow.indexOf('deliver.js'));
+test('obsolete cloud digest delivery workflow is removed', async () => {
+  await assert.rejects(
+    access(join(REPO_DIR, '.github', 'workflows', 'daily-lark-digest.yml')),
+    error => error.code === 'ENOENT'
+  );
 });
 
 test('Stage 1 wrapper does not impose source quotas', () => {
   const prompt = buildStage1Prompt('X', 'prompt', []);
   assert.match(prompt, /Do not impose an artificial quota/);
   assert.doesNotMatch(prompt, /equal number|same number|per source/);
+});
+
+test('one-pass prompt contains all finalized prompt roles and raw source data', () => {
+  const prompt = buildOnePassPrompt(fixture());
+  assert.match(prompt, /DIGEST_PROMPT_SENTINEL|TRANSLATE_PROMPT_SENTINEL|X_PROMPT_SENTINEL|PODCAST_PROMPT_SENTINEL|BLOG_PROMPT_SENTINEL/);
+  assert.match(prompt, /RAW_X_SENTINEL|RAW_PODCAST_SENTINEL|RAW_BLOG_SENTINEL/);
 });
