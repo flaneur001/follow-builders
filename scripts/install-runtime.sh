@@ -37,6 +37,7 @@ ARCHIVE_PATH="$STAGING_DIR/runtime.tar"
   scripts/prepare-digest.js \
   scripts/generate-digest.js \
   scripts/deliver.js \
+  scripts/operational-diagnostics.js \
   scripts/run-daily-digest.sh \
   scripts/package.json \
   scripts/package-lock.json \

@@ -12,27 +12,41 @@ ENV_PATH="$USER_DIR/.env"
 CONFIG_PATH="$USER_DIR/config.json"
 NODE_BIN='/usr/local/bin/node'
 
-fail() {
-  printf '%s\n' "daily digest failed: $*" >&2
+fail_environment() {
+  printf '%s\n' 'stage=environment_config status=failure failure=invalid' >&2
+  printf '%s\n' 'daily_digest status=failure' >&2
   exit 1
 }
 
-[ -x "$NODE_BIN" ] || fail "Node.js is not executable at $NODE_BIN"
-[ -d "$RUNTIME_DIR" ] || fail "production runtime directory is missing"
-[ -f "$ENV_PATH" ] || fail "local environment file is missing"
-[ -f "$CONFIG_PATH" ] || fail "local configuration file is missing"
+printf '%s\n' 'stage=environment_config status=started' >&2
+[ -x "$NODE_BIN" ] || fail_environment
+[ -d "$RUNTIME_DIR" ] || fail_environment
+[ -f "$ENV_PATH" ] || fail_environment
+[ -f "$CONFIG_PATH" ] || fail_environment
 
-cd "$RUNTIME_DIR" || fail "could not enter production runtime directory"
+cd "$RUNTIME_DIR" || fail_environment
+
+DIGEST_FILE="$(/usr/bin/mktemp /private/tmp/follow-builders-digest.XXXXXX 2>/dev/null)" || fail_environment
+RUN_LOG_FILE="$(/usr/bin/mktemp /private/tmp/follow-builders-run.XXXXXX 2>/dev/null)" || {
+  /bin/rm -f "$DIGEST_FILE"
+  fail_environment
+}
+cleanup() {
+  /bin/rm -f "$DIGEST_FILE" "$RUN_LOG_FILE"
+}
+trap cleanup EXIT HUP INT TERM
 
 # The local .env is user-owned trusted configuration. Export it so both the
 # generator and delivery process receive the same credentials without putting
 # secrets in this repository or the LaunchAgent plist.
 set -a
-. "$ENV_PATH"
+if ! . "$ENV_PATH" 2>"$RUN_LOG_FILE"; then
+  fail_environment
+fi
 set +a
 
-: "${DEEPSEEK_API_KEY:?daily digest failed: DEEPSEEK_API_KEY is missing}"
-: "${LARK_WEBHOOK_URL:?daily digest failed: LARK_WEBHOOK_URL is missing}"
+[ -n "${DEEPSEEK_API_KEY:-}" ] || fail_environment
+[ -n "${LARK_WEBHOOK_URL:-}" ] || fail_environment
 
 # Preserve the established proxy settings for source fetching, DeepSeek, and
 # Lark. Set after .env so a local env file cannot accidentally disable them.
@@ -48,29 +62,30 @@ export DIGEST_PIPELINE="${DIGEST_PIPELINE:-one-pass}"
   if (config?.delivery?.method !== "lark") {
     throw new Error("config.json must set delivery.method to lark for the daily production runner");
   }
-' "$CONFIG_PATH" || fail "local configuration is not valid for Lark delivery"
-
-DIGEST_FILE="$(/usr/bin/mktemp /private/tmp/follow-builders-digest.XXXXXX)" || fail "could not create private digest file"
-RUN_LOG_FILE="$(/usr/bin/mktemp /private/tmp/follow-builders-run.XXXXXX)" || {
-  /bin/rm -f "$DIGEST_FILE"
-  fail "could not create private run log"
-}
-cleanup() {
-  /bin/rm -f "$DIGEST_FILE" "$RUN_LOG_FILE"
-}
-trap cleanup EXIT HUP INT TERM
+' "$CONFIG_PATH" >"$RUN_LOG_FILE" 2>&1 || fail_environment
+printf '%s\n' 'stage=environment_config status=ok' >&2
 
 # generate-digest.js performs prepare -> DeepSeek generation -> validation. Its
-# stdout is only the validated final digest. Its diagnostics are kept private:
-# an upstream API response or partial model output must never reach launchd logs.
-if ! "$NODE_BIN" "$RUNTIME_DIR/scripts/generate-digest.js" >"$DIGEST_FILE" 2>"$RUN_LOG_FILE"; then
-  fail "digest generation or validation failed"
+# stdout is only the validated final digest. Allow-listed operational markers
+# use fd 3; all ordinary stderr remains private and is deleted during cleanup.
+if ! FOLLOW_BUILDERS_DIAGNOSTIC_FD=3 "$NODE_BIN" "$RUNTIME_DIR/scripts/generate-digest.js" \
+  3>&2 >"$DIGEST_FILE" 2>"$RUN_LOG_FILE"; then
+  printf '%s\n' 'daily_digest status=failure' >&2
+  exit 1
 fi
-[ -s "$DIGEST_FILE" ] || fail "generator produced no final digest"
+[ -s "$DIGEST_FILE" ] || {
+  printf '%s\n' 'stage=generation status=failure failure=empty_output' >&2
+  printf '%s\n' 'daily_digest status=failure' >&2
+  exit 1
+}
 
 # This is intentionally the first and only delivery invocation. No prepared
 # data, progress status, or failed/partial model output reaches Lark.
+printf '%s\n' 'stage=delivery status=started' >&2
 if ! "$NODE_BIN" "$RUNTIME_DIR/scripts/deliver.js" --file "$DIGEST_FILE" >"$RUN_LOG_FILE" 2>&1; then
-  fail "Lark delivery failed"
+  printf '%s\n' 'stage=delivery status=failure failure=lark_request' >&2
+  printf '%s\n' 'daily_digest status=failure' >&2
+  exit 1
 fi
-printf '%s\n' 'daily digest completed'
+printf '%s\n' 'stage=delivery status=ok' >&2
+printf '%s\n' 'daily_digest status=success' >&2

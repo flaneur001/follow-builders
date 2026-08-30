@@ -13,9 +13,15 @@ import {
   generateDigest,
   generateTwoStageDigest,
   generateWithDeepSeek,
+  parsePrepared,
   resolvePipeline,
   validateDigest
 } from './generate-digest.js';
+import {
+  OperationalError,
+  diagnosticForError,
+  formatOperationalDiagnostic
+} from './operational-diagnostics.js';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = join(SCRIPT_DIR, '..');
@@ -118,7 +124,7 @@ test('a two-stage generation failure prevents Stage 2', async () => {
         return 'notes';
       }
     }),
-    /Stage 1 X generation failed: provider unavailable/
+    error => error.code === 'generation_failed'
   );
   assert.equal(stage2Called, false);
 });
@@ -130,7 +136,7 @@ test('one-pass validation failure returns no digest for downstream delivery', as
       pipeline: 'one-pass', generate: async () => 'malformed final response',
       deliver: async () => { deliveryCalled = true; }
     }),
-    /One-pass validation failed: Generated digest is unexpectedly short/
+    error => error.code === 'validation_invalid_digest'
   );
   assert.equal(deliveryCalled, false);
 });
@@ -142,7 +148,7 @@ test('one-pass generation failure returns no digest for downstream delivery', as
       pipeline: 'one-pass', generate: async () => { throw new Error('provider unavailable'); },
       deliver: async () => { deliveryCalled = true; }
     }),
-    /One-pass generation failed: provider unavailable/
+    error => error.code === 'generation_failed'
   );
   assert.equal(deliveryCalled, false);
 });
@@ -168,7 +174,7 @@ test('DeepSeek SSE without terminal [DONE] fails and never retries', async () =>
   const mock = requestMock({ chunks: [sse(JSON.stringify({ choices: [{ delta: { content: 'partial' } }] }))] });
   await assert.rejects(
     generateWithDeepSeek('prompt', 'test-secret', { requestImpl: mock.requestImpl, agent: false }),
-    /stream ended without terminal \[DONE\]/
+    error => error.code === 'generation_sse_incomplete'
   );
   assert.equal(mock.calls, 1);
 });
@@ -181,18 +187,86 @@ test('DeepSeek SSE rejects data after terminal [DONE]', async () => {
   ] });
   await assert.rejects(
     generateWithDeepSeek('prompt', 'test-secret', { requestImpl: mock.requestImpl, agent: false }),
-    /data after terminal \[DONE\]/
+    error => error.code === 'generation_sse_error'
   );
   assert.equal(mock.calls, 1);
 });
 
-test('DeepSeek errors redact API keys', async () => {
+test('DeepSeek HTTP errors expose only a safe typed category', async () => {
   const apiKey = 'test-super-secret-key';
   const mock = requestMock({ statusCode: 403, chunks: [JSON.stringify({ error: `bad key ${apiKey}` })] });
   await assert.rejects(
     generateWithDeepSeek('prompt', apiKey, { requestImpl: mock.requestImpl, agent: false }),
-    error => !error.message.includes(apiKey) && error.message.includes('[redacted]')
+    error => error.code === 'generation_http' && !error.message.includes(apiKey)
   );
+});
+
+test('preparation failure maps to a fixed safe diagnostic', () => {
+  assert.throws(
+    () => parsePrepared('{invalid json'),
+    error => formatOperationalDiagnostic(diagnosticForError(error)) === 'stage=prepare status=failure failure=failed'
+  );
+});
+
+test('DeepSeek network/request failure maps to a fixed safe diagnostic', async () => {
+  const requestImpl = () => {
+    const request = new EventEmitter();
+    request.write = () => {};
+    request.end = () => queueMicrotask(() => request.emit('error', new Error('socket detail must stay private')));
+    return request;
+  };
+  await assert.rejects(
+    generateWithDeepSeek('private request body', 'private-api-key', { requestImpl, agent: false }),
+    error => formatOperationalDiagnostic(diagnosticForError(error)) === 'stage=generation status=failure failure=network'
+  );
+});
+
+test('incomplete SSE maps to its fixed safe diagnostic', async () => {
+  const mock = requestMock({ chunks: [sse(JSON.stringify({ choices: [{ delta: { content: 'partial private output' } }] }))] });
+  await assert.rejects(
+    generateWithDeepSeek('prompt', 'private-api-key', { requestImpl: mock.requestImpl, agent: false }),
+    error => formatOperationalDiagnostic(diagnosticForError(error)) === 'stage=generation status=failure failure=sse_incomplete'
+  );
+});
+
+test('validation failure maps to its fixed safe diagnostic', async () => {
+  await assert.rejects(
+    generateDigest(fixture(), { pipeline: 'one-pass', generate: async () => 'private invalid model output' }),
+    error => formatOperationalDiagnostic(diagnosticForError(error)) === 'stage=validation status=failure failure=invalid_digest'
+  );
+});
+
+test('delivery failure and successful run have fixed classifications', () => {
+  assert.equal(
+    formatOperationalDiagnostic(diagnosticForError(new OperationalError('delivery_lark_request'))),
+    'stage=delivery status=failure failure=lark_request'
+  );
+  assert.equal(
+    formatOperationalDiagnostic({ dailyDigest: true, status: 'success' }),
+    'daily_digest status=success'
+  );
+});
+
+test('successful one-pass progress contains only fixed operational markers', async () => {
+  const events = [];
+  await generateDigest(fixture(), {
+    pipeline: 'one-pass', generate: async () => validDigest(), onProgress: event => events.push(formatOperationalDiagnostic(event))
+  });
+  assert.deepEqual(events, [
+    'stage=generation status=started pipeline=one_pass',
+    'stage=generation status=ok pipeline=one_pass',
+    'stage=validation status=started',
+    'stage=validation status=ok'
+  ]);
+});
+
+test('safe diagnostics never contain secrets or generated content', () => {
+  const secret = 'secret-api-key-and-webhook';
+  const generated = 'private partial and final digest content';
+  const error = new OperationalError('generation_network', { cause: new Error(`${secret} ${generated}`) });
+  const diagnostic = formatOperationalDiagnostic(diagnosticForError(error));
+  assert.equal(diagnostic, 'stage=generation status=failure failure=network');
+  assert.doesNotMatch(diagnostic, new RegExp(`${secret}|${generated}`));
 });
 
 test('source URL validation rejects links outside prepared sources', () => {

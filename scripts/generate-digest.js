@@ -9,6 +9,11 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
+import {
+  OperationalError,
+  diagnosticForError,
+  emitOperationalDiagnostic
+} from './operational-diagnostics.js';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const ENV_PATH = join(homedir(), '.follow-builders', '.env');
@@ -22,18 +27,16 @@ const STAGE_1_SPECS = [
   { key: 'blogs', label: 'Stage 1 Blogs', promptKey: 'summarize_blogs', artifact: 'version-f-blog-notes.md' }
 ];
 
-function run(command, args, { env = process.env, input, label }) {
+function run(command, args, { env = process.env, input, label, failureCode = 'generation_failed' }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: SCRIPT_DIR, env, stdio: ['pipe', 'pipe', 'pipe'] });
     const stdout = [];
-    const stderr = [];
     child.stdout.on('data', chunk => stdout.push(chunk));
-    child.stderr.on('data', chunk => stderr.push(chunk));
-    child.on('error', () => reject(new Error(`${label} could not start`)));
+    child.stderr.on('data', () => {});
+    child.on('error', () => reject(new OperationalError(failureCode)));
     child.on('close', code => {
       const output = Buffer.concat(stdout).toString('utf-8');
-      const errorOutput = Buffer.concat(stderr).toString('utf-8').trim();
-      if (code !== 0) return reject(new Error(`${label} failed with exit code ${code}${errorOutput ? `: ${errorOutput.slice(-2000)}` : ''}`));
+      if (code !== 0) return reject(new OperationalError(failureCode));
       resolve(output);
     });
     child.stdin.end(input);
@@ -42,19 +45,19 @@ function run(command, args, { env = process.env, input, label }) {
 
 function parsePrepared(raw) {
   let prepared;
-  try { prepared = JSON.parse(raw); } catch { throw new Error('prepare-digest.js returned invalid JSON'); }
-  if (prepared.status !== 'ok') throw new Error('prepare-digest.js did not return an ok status');
+  try { prepared = JSON.parse(raw); } catch { throw new OperationalError('prepare_failed'); }
+  if (prepared.status !== 'ok') throw new OperationalError('prepare_failed');
   const missingPrompts = REQUIRED_PROMPTS.filter(key => !prepared.prompts?.[key]);
-  if (missingPrompts.length) throw new Error(`Missing v0.2 prompts: ${missingPrompts.join(', ')}`);
+  if (missingPrompts.length) throw new OperationalError('prepare_failed');
   const sourceCount = (prepared.podcasts?.length || 0) + (prepared.x?.length || 0) + (prepared.blogs?.length || 0);
-  if (sourceCount === 0) throw new Error('No source content was available for digest generation');
+  if (sourceCount === 0) throw new OperationalError('prepare_failed');
   return prepared;
 }
 
 function resolvePipeline(value = process.env.DIGEST_PIPELINE) {
   if (value === undefined || value === '') return 'one-pass';
   if (value === 'one-pass' || value === 'two-stage') return value;
-  throw new Error(`Unsupported DIGEST_PIPELINE: ${value}`);
+  throw new OperationalError('environment_config');
 }
 
 function collectSourceUrls(value, urls = new Set()) {
@@ -121,16 +124,6 @@ function buildStage2Prompt(notes, prompts) {
   ].join('\n');
 }
 
-function safeDeepSeekError(detail, apiKey) {
-  const redacted = apiKey
-    ? String(detail || 'unknown error').replaceAll(apiKey, '[redacted]')
-    : String(detail || 'unknown error');
-  return redacted
-    .replace(/Bearer\s+[^\s,]+/gi, 'Bearer [redacted]')
-    .replace(/key=[^&\s]+/gi, 'key=[redacted]')
-    .replace(/\s+/g, ' ').trim().slice(0, 1000);
-}
-
 class HttpConnectProxyAgent extends https.Agent {
   constructor(proxyUrl) { super({ keepAlive: false }); this.proxyUrl = proxyUrl; }
 
@@ -178,7 +171,7 @@ function parseSseChunk(buffer, onData) {
 }
 
 function generateWithDeepSeek(prompt, apiKey, { requestImpl = https.request, agent = createDeepSeekAgent() } = {}) {
-  if (!apiKey) return Promise.reject(new Error('Missing required DEEPSEEK_API_KEY'));
+  if (!apiKey) return Promise.reject(new OperationalError('environment_config'));
   const payload = JSON.stringify({
     model: DEEPSEEK_MODEL, messages: [{ role: 'user', content: prompt }], stream: true,
     thinking: { type: 'enabled' }, reasoning_effort: 'high'
@@ -193,10 +186,9 @@ function generateWithDeepSeek(prompt, apiKey, { requestImpl = https.request, age
         method: 'POST', agent,
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${apiKey}` }
       }, response => {
-        const chunks = [];
         if (response.statusCode < 200 || response.statusCode >= 300) {
-          response.on('data', chunk => chunks.push(chunk));
-          response.on('end', () => fail(new Error(`DeepSeek API request failed (HTTP ${response.statusCode}): ${safeDeepSeekError(Buffer.concat(chunks).toString('utf8'), apiKey)}`)));
+          response.on('data', () => {});
+          response.on('end', () => fail(new OperationalError('generation_http')));
           return;
         }
         let buffer = '';
@@ -206,35 +198,37 @@ function generateWithDeepSeek(prompt, apiKey, { requestImpl = https.request, age
           if (settled) return;
           try {
             buffer = parseSseChunk(buffer + chunk.toString('utf8'), data => {
-              if (done) throw new Error('DeepSeek API stream contained data after terminal [DONE]');
+              if (done) throw new OperationalError('generation_sse_error');
               if (data === '[DONE]') { done = true; return; }
               let event;
-              try { event = JSON.parse(data); } catch { throw new Error('DeepSeek API returned invalid SSE JSON'); }
+              try { event = JSON.parse(data); } catch { throw new OperationalError('generation_sse_error'); }
               const delta = event.choices?.[0]?.delta?.content;
               if (typeof delta === 'string') content += delta;
             });
-          } catch (error) { fail(error); }
+          } catch (error) { fail(error instanceof OperationalError ? error : new OperationalError('generation_sse_error')); }
         });
         response.on('end', () => {
-          if (!done) return fail(new Error('DeepSeek API stream ended without terminal [DONE]'));
-          if (!content.trim()) return fail(new Error('DeepSeek API stream returned no text content'));
+          if (!done) return fail(new OperationalError('generation_sse_incomplete'));
+          if (!content.trim()) return fail(new OperationalError('generation_empty_output'));
           if (!settled) { settled = true; resolve(content); }
         });
-        response.on('error', () => fail(new Error('DeepSeek API stream failed')));
+        response.on('error', () => fail(new OperationalError('generation_network')));
       });
-      request.on('error', () => fail(new Error('DeepSeek API request failed (network error)')));
+      request.on('error', () => fail(new OperationalError('generation_network')));
       request.write(payload);
       request.end();
     } catch (error) {
-      fail(new Error(`DeepSeek API request could not start: ${safeDeepSeekError(error.message, apiKey)}`));
+      fail(error instanceof OperationalError ? error : new OperationalError('generation_network'));
     }
   });
 }
 
 async function generateStage(label, prompt, generate) {
   let output;
-  try { output = (await generate(prompt)).trim(); } catch (error) { throw new Error(`${label} generation failed: ${error.message}`); }
-  if (!output) throw new Error(`${label} generation returned empty output`);
+  try { output = (await generate(prompt)).trim(); } catch (error) {
+    throw error instanceof OperationalError ? error : new OperationalError('generation_failed');
+  }
+  if (!output) throw new OperationalError('generation_empty_output');
   return output;
 }
 
@@ -245,35 +239,39 @@ async function preserveStage1Artifact(directory, filename, content) {
 }
 
 async function generateOnePassDigest(prepared, { generate, onProgress = () => {} }) {
-  onProgress({ status: 'started', stage: 'One-pass' });
+  onProgress({ status: 'started', stage: 'generation', pipeline: 'one_pass' });
   const digest = await generateStage('One-pass', buildOnePassPrompt(prepared), generate);
+  onProgress({ status: 'ok', stage: 'generation', pipeline: 'one_pass' });
+  onProgress({ status: 'started', stage: 'validation' });
   let validated;
-  try { validated = validateDigest(digest, prepared); } catch (error) { throw new Error(`One-pass validation failed: ${error.message}`); }
-  onProgress({ status: 'completed', stage: 'One-pass', characters: Array.from(validated).length, sourceLinks: (validated.match(/https?:\/\/\S+/g) || []).length });
+  try { validated = validateDigest(digest, prepared); } catch { throw new OperationalError('validation_invalid_digest'); }
+  onProgress({ status: 'ok', stage: 'validation' });
   return { digest: validated };
 }
 
 async function generateTwoStageDigest(prepared, { generate, stage1Directory, onProgress = () => {} }) {
   const notes = {};
   for (const spec of STAGE_1_SPECS) {
-    onProgress({ status: 'started', stage: spec.label });
+    onProgress({ status: 'started', stage: 'generation', pipeline: 'two_stage' });
     notes[spec.key] = await generateStage(spec.label, buildStage1Prompt(spec.key === 'podcasts' ? 'podcast' : spec.key, prepared.prompts[spec.promptKey], prepared[spec.key]), generate);
     await preserveStage1Artifact(stage1Directory, spec.artifact, notes[spec.key]);
-    onProgress({ status: 'completed', stage: spec.label, characters: Array.from(notes[spec.key]).length });
+    onProgress({ status: 'ok', stage: 'generation', pipeline: 'two_stage' });
   }
-  onProgress({ status: 'started', stage: 'Stage 2' });
+  onProgress({ status: 'started', stage: 'generation', pipeline: 'two_stage' });
   const stage2Prompt = buildStage2Prompt(notes, prepared.prompts);
   const digest = await generateStage('Stage 2', stage2Prompt, generate);
+  onProgress({ status: 'ok', stage: 'generation', pipeline: 'two_stage' });
+  onProgress({ status: 'started', stage: 'validation' });
   let validated;
-  try { validated = validateDigest(digest, prepared); } catch (error) { throw new Error(`Stage 2 validation failed: ${error.message}`); }
-  onProgress({ status: 'completed', stage: 'Stage 2', characters: Array.from(validated).length, sourceLinks: (validated.match(/https?:\/\/\S+/g) || []).length });
+  try { validated = validateDigest(digest, prepared); } catch { throw new OperationalError('validation_invalid_digest'); }
+  onProgress({ status: 'ok', stage: 'validation' });
   return { digest: validated, notes, stage2Prompt };
 }
 
 async function generateDigest(prepared, { pipeline = resolvePipeline(), generate, stage1Directory, onProgress } = {}) {
   if (pipeline === 'one-pass') return generateOnePassDigest(prepared, { generate, onProgress });
   if (pipeline === 'two-stage') return generateTwoStageDigest(prepared, { generate, stage1Directory, onProgress });
-  throw new Error(`Unsupported DIGEST_PIPELINE: ${pipeline}`);
+  throw new OperationalError('environment_config');
 }
 
 async function generateAndDeliver(prepared, options) {
@@ -286,24 +284,30 @@ async function generateAndDeliver(prepared, options) {
 async function main() {
   loadEnv({ path: ENV_PATH });
   const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) throw new Error('Missing required DEEPSEEK_API_KEY');
+  if (!apiKey) throw new OperationalError('environment_config');
   const pipeline = resolvePipeline();
   const prepareEnv = { ...process.env };
   delete prepareEnv.DEEPSEEK_API_KEY;
-  const prepared = parsePrepared(await run(process.execPath, [join(SCRIPT_DIR, 'prepare-digest.js')], { env: prepareEnv, label: 'Digest preparation' }));
-  console.error(JSON.stringify({ status: 'prepared', pipeline, podcastEpisodes: prepared.stats?.podcastEpisodes || 0, xBuilders: prepared.stats?.xBuilders || 0, blogPosts: prepared.stats?.blogPosts || 0 }));
+  emitOperationalDiagnostic({ stage: 'prepare', status: 'started' });
+  const prepared = parsePrepared(await run(process.execPath, [join(SCRIPT_DIR, 'prepare-digest.js')], {
+    env: prepareEnv, label: 'Digest preparation', failureCode: 'prepare_failed'
+  }));
+  emitOperationalDiagnostic({ stage: 'prepare', status: 'ok' });
   const result = await generateDigest(prepared, {
     pipeline, generate: prompt => generateWithDeepSeek(prompt, apiKey), stage1Directory: process.env.FOLLOW_BUILDERS_STAGE1_DIR,
-    onProgress: event => console.error(JSON.stringify(event))
+    onProgress: event => emitOperationalDiagnostic(event)
   });
   process.stdout.write(`${result.digest}\n`);
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
-if (isMain) main().catch(err => { console.error(JSON.stringify({ status: 'error', message: err.message })); process.exit(1); });
+if (isMain) main().catch(error => {
+  emitOperationalDiagnostic(diagnosticForError(error));
+  process.exit(1);
+});
 
 export {
   buildOnePassPrompt, buildStage1Prompt, buildStage2Prompt, createDeepSeekAgent,
   generateAndDeliver, generateDigest, generateOnePassDigest, generateTwoStageDigest, generateWithDeepSeek,
-  parsePrepared, resolvePipeline, safeDeepSeekError, validateDigest
+  parsePrepared, resolvePipeline, validateDigest
 };

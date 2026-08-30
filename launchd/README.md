@@ -26,6 +26,10 @@ then replaces the runtime directory. `.runtime-version` records the deployed
 commit. Local secrets and configuration remain only under
 `/Users/jin/.follow-builders`.
 
+The runner writes only fixed operational stage markers to launchd stderr. Raw
+provider diagnostics and delivery output stay in a private temporary file that
+is removed on every exit; generated Digest content is never written to logs.
+
 ## LaunchAgent installation
 
 Copy the plist to this per-user location, then load it in the logged-in user's
