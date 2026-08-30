@@ -82,6 +82,9 @@ async function main() {
   if (!feedX) errors.push('Could not fetch tweet feed');
   if (!feedPodcasts) errors.push('Could not fetch podcast feed');
   if (!feedBlogs) errors.push('Could not fetch blog feed');
+  if (!feedX || !feedPodcasts || !feedBlogs) {
+    throw new Error(`Source preparation failed: ${errors.join('; ')}`);
+  }
   if (feedX?.errors?.length) {
     errors.push(
       ...feedX.errors.map((error) => `Tweet feed problem: ${error}`)
@@ -133,6 +136,14 @@ async function main() {
     } else {
       errors.push(`Could not load prompt: ${filename}`);
     }
+  }
+
+  const missingPrompts = PROMPT_FILES.filter(filename => {
+    const key = filename.replace('.md', '').replace(/-/g, '_');
+    return !prompts[key];
+  });
+  if (missingPrompts.length > 0) {
+    throw new Error(`Source preparation failed: missing prompts ${missingPrompts.join(', ')}`);
   }
 
   // 4. Build the output — everything the LLM needs in one blob

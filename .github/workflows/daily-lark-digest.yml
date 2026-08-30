@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  copilot-requests: write
 
 concurrency:
   group: daily-follow-builders-lark
@@ -35,15 +34,17 @@ jobs:
       - name: Install dependencies
         run: npm ci --prefix scripts
 
-      - name: Install GitHub Copilot CLI
-        run: npm install --global @github/copilot
-
-      - name: Validate Lark secret
+      - name: Validate required secrets
         env:
           LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           if [ -z "$LARK_WEBHOOK_URL" ]; then
             echo "::error::Missing required repository secret LARK_WEBHOOK_URL"
+            exit 1
+          fi
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "::error::Missing required repository secret GEMINI_API_KEY"
             exit 1
           fi
 
@@ -57,10 +58,22 @@ jobs:
 
       - name: Generate Follow Builders v0.2 digest
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FOLLOW_BUILDERS_STAGE1_DIR: ${{ runner.temp }}/follow-builders-stage1
         run: node scripts/generate-digest.js > "$RUNNER_TEMP/follow-builders-digest.txt"
 
+      - name: Preserve Stage 1 notes for debugging
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: follow-builders-stage1-${{ github.run_id }}
+          path: ${{ runner.temp }}/follow-builders-stage1/*.md
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Deliver digest to Lark
+        if: success()
         env:
           LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
         run: node scripts/deliver.js --file "$RUNNER_TEMP/follow-builders-digest.txt"
