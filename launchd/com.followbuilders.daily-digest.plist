@@ -8,11 +8,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
-    <string>/Users/jin/Documents/Codex/follow-builders/scripts/run-daily-digest.sh</string>
+    <string>/Users/jin/.local/share/follow-builders/runtime/scripts/run-daily-digest.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/jin/Documents/Codex/follow-builders</string>
+  <string>/Users/jin/.local/share/follow-builders/runtime</string>
 
   <key>ProcessType</key>
   <string>Background</string>

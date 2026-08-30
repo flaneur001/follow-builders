@@ -6,7 +6,7 @@ set -eu
 
 umask 077
 
-REPO_DIR='/Users/jin/Documents/Codex/follow-builders'
+RUNTIME_DIR='/Users/jin/.local/share/follow-builders/runtime'
 USER_DIR='/Users/jin/.follow-builders'
 ENV_PATH="$USER_DIR/.env"
 CONFIG_PATH="$USER_DIR/config.json"
@@ -18,11 +18,11 @@ fail() {
 }
 
 [ -x "$NODE_BIN" ] || fail "Node.js is not executable at $NODE_BIN"
-[ -d "$REPO_DIR" ] || fail "repository directory is missing"
+[ -d "$RUNTIME_DIR" ] || fail "production runtime directory is missing"
 [ -f "$ENV_PATH" ] || fail "local environment file is missing"
 [ -f "$CONFIG_PATH" ] || fail "local configuration file is missing"
 
-cd "$REPO_DIR" || fail "could not enter repository directory"
+cd "$RUNTIME_DIR" || fail "could not enter production runtime directory"
 
 # The local .env is user-owned trusted configuration. Export it so both the
 # generator and delivery process receive the same credentials without putting
@@ -63,14 +63,14 @@ trap cleanup EXIT HUP INT TERM
 # generate-digest.js performs prepare -> DeepSeek generation -> validation. Its
 # stdout is only the validated final digest. Its diagnostics are kept private:
 # an upstream API response or partial model output must never reach launchd logs.
-if ! "$NODE_BIN" "$REPO_DIR/scripts/generate-digest.js" >"$DIGEST_FILE" 2>"$RUN_LOG_FILE"; then
+if ! "$NODE_BIN" "$RUNTIME_DIR/scripts/generate-digest.js" >"$DIGEST_FILE" 2>"$RUN_LOG_FILE"; then
   fail "digest generation or validation failed"
 fi
 [ -s "$DIGEST_FILE" ] || fail "generator produced no final digest"
 
 # This is intentionally the first and only delivery invocation. No prepared
 # data, progress status, or failed/partial model output reaches Lark.
-if ! "$NODE_BIN" "$REPO_DIR/scripts/deliver.js" --file "$DIGEST_FILE" >"$RUN_LOG_FILE" 2>&1; then
+if ! "$NODE_BIN" "$RUNTIME_DIR/scripts/deliver.js" --file "$DIGEST_FILE" >"$RUN_LOG_FILE" 2>&1; then
   fail "Lark delivery failed"
 fi
 printf '%s\n' 'daily digest completed'

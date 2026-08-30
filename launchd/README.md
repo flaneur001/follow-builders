@@ -3,7 +3,30 @@
 The prepared LaunchAgent is [`com.followbuilders.daily-digest.plist`](com.followbuilders.daily-digest.plist).
 Phase 3A deliberately does **not** copy, load, bootstrap, or run it.
 
-## Intended installation (Phase 3B)
+## Runtime deployment
+
+The LaunchAgent executes a minimal runtime snapshot outside macOS-protected
+Documents directories:
+
+```text
+/Users/jin/.local/share/follow-builders/runtime
+```
+
+After committing deployment changes, refresh that snapshot from a specific
+commit with:
+
+```sh
+scripts/install-runtime.sh <commit>
+```
+
+The installer uses an explicit file manifest and `git archive`, so uncommitted
+working-tree changes, `.git`, tests, examples, feeds, and local secrets are not
+copied. It installs locked production dependencies in the staged snapshot and
+then replaces the runtime directory. `.runtime-version` records the deployed
+commit. Local secrets and configuration remain only under
+`/Users/jin/.follow-builders`.
+
+## LaunchAgent installation
 
 Copy the plist to this per-user location, then load it in the logged-in user's
 launchd domain:
@@ -12,7 +35,8 @@ launchd domain:
 /Users/jin/Library/LaunchAgents/com.followbuilders.daily-digest.plist
 ```
 
-The plist starts the runner with absolute paths and a fixed working directory.
+The plist starts the runtime runner with absolute paths and a fixed runtime
+working directory.
 The runner itself reads only these local files:
 
 ```text
