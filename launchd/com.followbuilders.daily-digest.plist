@@ -25,6 +25,9 @@
     <integer>0</integer>
   </dict>
 
+  <key>StartInterval</key>
+  <integer>1800</integer>
+
   <key>StandardOutPath</key>
   <string>/Users/jin/.follow-builders/daily-digest.log</string>
   <key>StandardErrorPath</key>

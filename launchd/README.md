@@ -30,6 +30,23 @@ The runner writes only fixed operational stage markers to launchd stderr. Raw
 provider diagnostics and delivery output stay in a private temporary file that
 is removed on every exit; generated Digest content is never written to logs.
 
+The LaunchAgent retains its 08:00 calendar trigger and also performs a local
+eligibility check every 30 minutes. The interval does not wake a sleeping Mac.
+After 08:00, production runs only when the console session is active, the wake
+is user-triggered, the display is powered, the DeepSeek endpoint is reachable
+through the local proxy, no other run holds the lock, and today's terminal state
+is absent.
+
+Scheduling state is stored under `/Users/jin/.follow-builders`:
+
+- `daily-digest.lock/` is a short-lived process lock removed after every run.
+- `daily-success.json` contains only a local date and terminal status: `success` after
+  validated Lark delivery, or `skipped` when that date is explicitly suppressed.
+  Either status blocks that date only; failed and ineligible attempts write neither.
+
+Ineligible and failed attempts never create daily state. After delivery succeeds,
+the `success` state is written atomically so later triggers skip that day.
+
 ## LaunchAgent installation
 
 Copy the plist to this per-user location, then load it in the logged-in user's

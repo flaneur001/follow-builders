@@ -38,7 +38,9 @@ ARCHIVE_PATH="$STAGING_DIR/runtime.tar"
   scripts/generate-digest.js \
   scripts/deliver.js \
   scripts/operational-diagnostics.js \
+  scripts/scheduling-guard.js \
   scripts/run-daily-digest.sh \
+  scripts/run-production-digest.sh \
   scripts/package.json \
   scripts/package-lock.json \
   prompts/summarize-podcast.md \
@@ -51,6 +53,7 @@ ARCHIVE_PATH="$STAGING_DIR/runtime.tar"
 
 "$NPM_BIN" ci --prefix "$STAGING_DIR/scripts" --omit=dev --ignore-scripts
 /bin/chmod 700 "$STAGING_DIR/scripts/run-daily-digest.sh"
+/bin/chmod 700 "$STAGING_DIR/scripts/run-production-digest.sh"
 printf '%s\n' "$COMMIT" >"$STAGING_DIR/.runtime-version"
 
 PREVIOUS_DIR="$RUNTIME_PARENT/.runtime-previous"
